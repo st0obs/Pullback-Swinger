@@ -102,7 +102,7 @@ def turso_execute(sql: str, args: Optional[list] = None) -> Optional[dict]:
             elif isinstance(v, int):
                 typed.append({"type": "integer", "value": str(v)})
             elif isinstance(v, float):
-                typed.append({"type": "float", "value": v})
+                typed.append({"type": "text", "value": str(v)})
             else:
                 typed.append({"type": "text", "value": str(v)})
         stmt["args"] = typed
@@ -451,13 +451,12 @@ def sync_with_alpaca_positions(active: dict) -> dict:
 
 def scan_and_enter(universe: list, active: dict):
     if len(active) >= MAX_POSITIONS:
-        log.info(f"Max positions ({MAX_POSITIONS}) reached, skipping scan")
+        log.info(f"⏸️  Scan skipped — max positions ({MAX_POSITIONS}) already open")
         return
     if not check_spy_market_gate():
-        log.info("SPY gate CLOSED — no new entries today")
+        log.info("🚫 SPY gate CLOSED — no new entries today")
         return
 
-    log.info(f"Scanning {len(universe)} tickers...")
     candidates = []
     for ticker in universe:
         if ticker in active: continue
@@ -466,17 +465,19 @@ def scan_and_enter(universe: list, active: dict):
         setup = check_bone_zone_setup(ticker, bars)
         if setup: candidates.append(setup)
 
+    slots = MAX_POSITIONS - len(active)
+
     if not candidates:
-        log.info("No setups found this scan")
+        log.info(f"🔍 Scan complete: 0 candidates | active={len(active)}/{MAX_POSITIONS}")
         return
 
     candidates.sort(key=lambda s: s["rr_ratio"], reverse=True)
-    log.info(f"Found {len(candidates)} setups. Top 10:")
-    for i, s in enumerate(candidates[:10]):
-        log.info(f"  {i+1}. {s['ticker']} entry=${s['entry']} stop=${s['stop']} target=${s['target']} R/R={s['rr_ratio']}")
+    entering = min(len(candidates), slots)
+    watching = len(candidates) - entering
+    top_list = ", ".join(f"{s['ticker']}({s['rr_ratio']}R)" for s in candidates[:5])
+    log.info(f"🔍 Scan complete: {len(candidates)} candidates, entering {entering}, watching {watching} | top: {top_list}")
 
     equity = get_account_equity()
-    slots = MAX_POSITIONS - len(active)
     for setup in candidates[:slots]:
         shares = calc_position_size(setup["entry"], setup["stop"], equity)
         order_id = place_bracket_order(setup, shares)
@@ -584,6 +585,7 @@ def main():
     last_status = 0
     last_active_sync = 0
     last_heartbeat = 0
+    last_state = None
 
     while True:
         try:
@@ -614,10 +616,36 @@ def main():
                 turso_log_status(active, len(universe))
                 last_status = time.time()
 
-            # Status log every 10 min, but only during market hours
-            if (time.time() - last_heartbeat) >= 600 and is_market_open():
-                log.info(f"💓 {now.strftime('%H:%M:%S ET')} | window={in_trading_window()} | active={len(active)} | universe={len(universe)}")
-                last_heartbeat = time.time()
+            # Event-based logging — log STATE TRANSITIONS only, not repeated messages
+            # States: CLOSED, PREMARKET_OPEN, WAITING_WINDOW, TRADING, AFTER_WINDOW
+            mkt_open = is_market_open()
+            in_window = in_trading_window()
+            t = now.strftime("%H:%M")
+
+            if not mkt_open:
+                new_state = "CLOSED"
+            elif not in_window and t < TRADING_WINDOW_START:
+                new_state = "WAITING_WINDOW"
+            elif in_window:
+                new_state = "TRADING"
+            else:
+                new_state = "AFTER_WINDOW"
+
+            if new_state != last_state:
+                if new_state == "CLOSED":
+                    try:
+                        clock = trading.get_clock()
+                        next_open = clock.next_open.astimezone(ET)
+                        log.info(f"⏸️  Market closed | next open: {next_open.strftime('%Y-%m-%d %H:%M ET')}")
+                    except Exception:
+                        log.info(f"⏸️  Market closed")
+                elif new_state == "WAITING_WINDOW":
+                    log.info(f"🔔 Market open at {t} ET | waiting for trading window at {TRADING_WINDOW_START} ET")
+                elif new_state == "TRADING":
+                    log.info(f"🟢 Trading window OPEN at {t} ET | universe={len(universe)} tickers | scanning every 5 min")
+                elif new_state == "AFTER_WINDOW":
+                    log.info(f"🟡 Trading window closed at {t} ET | managing open positions only until EOD")
+                last_state = new_state
 
             time.sleep(30)
         except KeyboardInterrupt:
