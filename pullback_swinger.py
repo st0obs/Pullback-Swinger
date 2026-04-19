@@ -614,9 +614,9 @@ def main():
                 turso_log_status(active, len(universe))
                 last_status = time.time()
 
-            # Heartbeat every 60 seconds so you know it's alive
-            if (time.time() - last_heartbeat) >= 60:
-                log.info(f"💓 {now.strftime('%H:%M:%S ET')} | market_open={is_market_open()} | window={in_trading_window()} | active={len(active)} | universe={len(universe)}")
+            # Status log every 10 min, but only during market hours
+            if (time.time() - last_heartbeat) >= 600 and is_market_open():
+                log.info(f"💓 {now.strftime('%H:%M:%S ET')} | window={in_trading_window()} | active={len(active)} | universe={len(universe)}")
                 last_heartbeat = time.time()
 
             time.sleep(30)
