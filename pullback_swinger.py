@@ -1,30 +1,7 @@
 """
 Pullback Swinger Bot — Kunal Desai "Bone Zone" Strategy
-========================================================
-Buy pullbacks in uptrending stocks when price enters the Bone Zone
-(between 9 EMA and 20 EMA) on declining volume, then bounces with a green
-confirmation candle on increasing volume.
-
-Entry Criteria (ALL required):
-  1. Uptrend: price > 200DMA, 50DMA rising
-  2. Green Bone Zone: 9 EMA > 20 EMA
-  3. Pullback INTO Bone Zone within last 3 days
-  4. Confirmation candle: green + close > 9 EMA + volume > 20d avg
-  5. Not extended (price < 8% above 20 EMA)
-  6. Market gate: SPY > 200DMA
-
-Exit Rules:
-  - Stop: low of pullback OR below 20 EMA, whichever is lower
-  - Target: 3:1 R/R (capped at +10% from entry)
-  - At 1:1: stop → breakeven
-  - At 2:1: trail 9 EMA
-  - 3:55 PM ET: force-close all
-
-Position Sizing: 1% account risk per trade, max 5 simultaneous, min 1 share
-Trading Window: 10:30 AM - 3:30 PM ET (scan every 5 min)
-Storage: Turso (trades + status snapshots + active positions)
+Pandas-free version for fast deploy on Render.
 """
-
 import os
 import time
 import json
@@ -33,8 +10,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import requests
-import pandas as pd
-import numpy as np
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest, StopOrderRequest, GetOrdersRequest,
@@ -54,11 +29,9 @@ ALPACA_SECRET = os.getenv("ALPACA_SECRET", "9LRuW9U62YzJmkPg1zQ7447gMRRtkhMGCNzw
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 POLYGON_KEY = os.getenv("POLYGON_KEY", "8RK1dh1JG0yGxsTdoUvv7wrc2fb25r4W")
 
-# Turso
 TURSO_DB_URL = os.getenv("TURSO_DB_URL", "libsql://oanda-bot-st0obs.aws-us-east-2.turso.io")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3NzQ1NjE3NDQsImlkIjoiMDE5ZDJjMWUtOTMwMS03NzE5LTkwM2EtMzVkYzA4YTkyZWUxIiwicmlkIjoiZjlmODhhMzMtY2RiMS00ZGJmLWFjNzMtNDBkM2U1ODk0NmE0In0.WzYNF01DuIYesT4GR0_RWCD4yNPYVvKaDaeF_zkS-BA-DlRNrzVkrfMVijGhNOjHd8TV_L8MsT1bsY822_tEAw")
 
-# Strategy
 RISK_PER_TRADE_PCT = 0.01
 MAX_POSITIONS = 5
 MIN_RR_RATIO = 3.0
@@ -72,14 +45,10 @@ MIN_AVG_VOLUME = 500_000
 BONE_ZONE_LOOKBACK_DAYS = 3
 SPY_TREND_CHECK = True
 
-# Local state (ephemeral on Render, fine — Turso is source of truth)
 DATA_DIR = Path("/tmp/pullback_swinger") if os.getenv("RENDER") else Path.home() / "pullback_swinger_data"
 DATA_DIR.mkdir(exist_ok=True)
 POSITIONS_JSON = DATA_DIR / "active_positions.json"
 
-# =============================================================================
-# LOGGING
-# =============================================================================
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -87,12 +56,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("pullback_swinger")
 
-# =============================================================================
-# CLIENTS
-# =============================================================================
 trading = TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
 data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 ET = pytz.timezone("US/Eastern")
+
+
+# =============================================================================
+# INDICATORS (pure python)
+# =============================================================================
+def ema_list(values: list, period: int) -> list:
+    """EMA using standard alpha=2/(period+1)."""
+    if not values:
+        return []
+    alpha = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(out[-1] + alpha * (v - out[-1]))
+    return out
+
+
+def sma_list(values: list, period: int) -> list:
+    """SMA with None for first period-1 values."""
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(None)
+        else:
+            out.append(sum(values[i - period + 1:i + 1]) / period)
+    return out
 
 
 # =============================================================================
@@ -102,26 +93,25 @@ def turso_execute(sql: str, args: Optional[list] = None) -> Optional[dict]:
     url = TURSO_DB_URL.replace("libsql://", "https://") + "/v2/pipeline"
     stmt = {"sql": sql}
     if args:
-        typed_args = []
+        typed = []
         for v in args:
             if v is None:
-                typed_args.append({"type": "null"})
+                typed.append({"type": "null"})
             elif isinstance(v, bool):
-                typed_args.append({"type": "integer", "value": "1" if v else "0"})
+                typed.append({"type": "integer", "value": "1" if v else "0"})
             elif isinstance(v, int):
-                typed_args.append({"type": "integer", "value": str(v)})
+                typed.append({"type": "integer", "value": str(v)})
             elif isinstance(v, float):
-                typed_args.append({"type": "float", "value": str(v)})
+                typed.append({"type": "float", "value": str(v)})
             else:
-                typed_args.append({"type": "text", "value": str(v)})
-        stmt["args"] = typed_args
+                typed.append({"type": "text", "value": str(v)})
+        stmt["args"] = typed
     body = {"requests": [{"type": "execute", "stmt": stmt}, {"type": "close"}]}
     try:
         resp = requests.post(
             url,
             headers={"Authorization": f"Bearer {TURSO_AUTH_TOKEN}", "Content-Type": "application/json"},
-            json=body,
-            timeout=15,
+            json=body, timeout=15,
         )
         if resp.status_code != 200:
             log.warning(f"Turso error ({resp.status_code}): {resp.text[:300]}")
@@ -167,12 +157,9 @@ def turso_log_trade(event: str, setup: dict, shares: int = 0, exit_price: float 
         [
             now_et().isoformat(), event, setup.get("ticker", ""),
             int(shares),
-            float(setup.get("entry", 0)),
-            float(setup.get("stop", 0)),
-            float(setup.get("target", 0)),
-            float(exit_price), float(pnl),
-            float(setup.get("rr_ratio", 0)),
-            setup.get("stage", ""), reason,
+            float(setup.get("entry", 0)), float(setup.get("stop", 0)),
+            float(setup.get("target", 0)), float(exit_price), float(pnl),
+            float(setup.get("rr_ratio", 0)), setup.get("stage", ""), reason,
         ],
     )
 
@@ -269,13 +256,10 @@ def build_universe() -> list:
 
 
 # =============================================================================
-# INDICATORS & DATA
+# DATA FETCHING
 # =============================================================================
-def ema(s, p): return s.ewm(span=p, adjust=False).mean()
-def sma(s, p): return s.rolling(p).mean()
-
-
 def get_daily_bars(ticker: str, days: int = 250):
+    """Returns list of dicts: [{date, open, high, low, close, volume}, ...] chronological."""
     try:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=days + 50)
@@ -283,10 +267,11 @@ def get_daily_bars(ticker: str, days: int = 250):
         bars = data_client.get_stock_bars(req)
         if ticker not in bars.data or not bars.data[ticker]:
             return None
-        return pd.DataFrame([{
-            "date": b.timestamp.date(), "open": b.open, "high": b.high,
-            "low": b.low, "close": b.close, "volume": b.volume,
-        } for b in bars.data[ticker]])
+        return [{
+            "date": b.timestamp.date(),
+            "open": b.open, "high": b.high, "low": b.low,
+            "close": b.close, "volume": b.volume,
+        } for b in bars.data[ticker]]
     except Exception as e:
         log.debug(f"bars fetch failed for {ticker}: {e}")
         return None
@@ -309,39 +294,55 @@ def get_latest_price(ticker: str):
 # =============================================================================
 # BONE ZONE SETUP DETECTION
 # =============================================================================
-def check_bone_zone_setup(ticker: str, df):
-    if df is None or len(df) < 210:
+def check_bone_zone_setup(ticker: str, bars: list):
+    if bars is None or len(bars) < 210:
         return None
-    df = df.copy()
-    df["ema9"] = ema(df["close"], 9)
-    df["ema20"] = ema(df["close"], 20)
-    df["sma50"] = sma(df["close"], 50)
-    df["sma200"] = sma(df["close"], 200)
-    df["vol_avg20"] = sma(df["volume"], 20)
 
-    last = df.iloc[-1]
-    price = last["close"]
+    closes = [b["close"] for b in bars]
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    volumes = [b["volume"] for b in bars]
 
-    if price < last["sma200"]: return None
-    if last["sma50"] <= df.iloc[-6]["sma50"]: return None
-    if last["ema9"] <= last["ema20"]: return None
+    ema9 = ema_list(closes, 9)
+    ema20 = ema_list(closes, 20)
+    sma50 = sma_list(closes, 50)
+    sma200 = sma_list(closes, 200)
+    vol_avg20 = sma_list(volumes, 20)
 
-    recent = df.iloc[-(BONE_ZONE_LOOKBACK_DAYS + 1):-1]
+    n = len(bars)
+    last_close = closes[-1]
+    last_open = bars[-1]["open"]
+    last_vol = volumes[-1]
+    last_ema9 = ema9[-1]
+    last_ema20 = ema20[-1]
+    last_sma200 = sma200[-1]
+    last_vol_avg = vol_avg20[-1]
+
+    # Filter 1: Uptrend
+    if last_sma200 is None or last_close < last_sma200: return None
+    if sma50[-1] is None or sma50[-6] is None: return None
+    if sma50[-1] <= sma50[-6]: return None
+    if last_ema9 <= last_ema20: return None
+
+    # Filter 2: Recent pullback INTO the Bone Zone
     pullback_happened = False
     pullback_low = None
-    for _, row in recent.iterrows():
-        if row["low"] <= row["ema9"] and row["low"] >= row["ema20"] * 0.99:
+    for idx in range(max(0, n - BONE_ZONE_LOOKBACK_DAYS - 1), n - 1):
+        if lows[idx] <= ema9[idx] and lows[idx] >= ema20[idx] * 0.99:
             pullback_happened = True
-            pullback_low = row["low"] if pullback_low is None else min(pullback_low, row["low"])
+            pullback_low = lows[idx] if pullback_low is None else min(pullback_low, lows[idx])
     if not pullback_happened: return None
 
-    if last["close"] <= last["open"]: return None
-    if last["close"] <= last["ema9"]: return None
-    if last["volume"] <= last["vol_avg20"]: return None
-    if price > last["ema20"] * 1.08: return None
+    # Filter 3: Confirmation candle today
+    if last_close <= last_open: return None
+    if last_close <= last_ema9: return None
+    if last_vol_avg is None or last_vol <= last_vol_avg: return None
 
-    entry = price
-    raw_stop = min(pullback_low, last["ema20"])
+    # Filter 4: Not extended
+    if last_close > last_ema20 * 1.08: return None
+
+    entry = last_close
+    raw_stop = min(pullback_low, last_ema20)
     stop = round(raw_stop * 0.995, 2)
     risk_per_share = entry - stop
     if risk_per_share <= 0: return None
@@ -355,9 +356,9 @@ def check_bone_zone_setup(ticker: str, df):
     return {
         "ticker": ticker, "entry": round(entry, 2), "stop": stop, "target": target,
         "risk_per_share": round(risk_per_share, 2), "rr_ratio": actual_rr,
-        "ema9": round(last["ema9"], 2), "ema20": round(last["ema20"], 2),
-        "sma200": round(last["sma200"], 2),
-        "volume": int(last["volume"]), "vol_avg20": int(last["vol_avg20"]),
+        "ema9": round(last_ema9, 2), "ema20": round(last_ema20, 2),
+        "sma200": round(last_sma200, 2),
+        "volume": int(last_vol), "vol_avg20": int(last_vol_avg),
         "detected_at": now_et().isoformat(),
     }
 
@@ -365,14 +366,16 @@ def check_bone_zone_setup(ticker: str, df):
 def check_spy_market_gate() -> bool:
     if not SPY_TREND_CHECK:
         return True
-    df = get_daily_bars("SPY", days=250)
-    if df is None or len(df) < 200:
+    bars = get_daily_bars("SPY", days=250)
+    if bars is None or len(bars) < 200:
         log.warning("Could not fetch SPY — allowing trades (fail-open)")
         return True
-    df["sma200"] = sma(df["close"], 200)
-    last = df.iloc[-1]
-    gate_ok = last["close"] > last["sma200"]
-    log.info(f"SPY gate: price=${last['close']:.2f} 200DMA=${last['sma200']:.2f} → {'OPEN' if gate_ok else 'CLOSED'}")
+    closes = [b["close"] for b in bars]
+    sma200 = sma_list(closes, 200)
+    last_close = closes[-1]
+    last_sma200 = sma200[-1]
+    gate_ok = last_close > last_sma200
+    log.info(f"SPY gate: price=${last_close:.2f} 200DMA=${last_sma200:.2f} → {'OPEN' if gate_ok else 'CLOSED'}")
     return gate_ok
 
 
@@ -458,9 +461,9 @@ def scan_and_enter(universe: list, active: dict):
     candidates = []
     for ticker in universe:
         if ticker in active: continue
-        df = get_daily_bars(ticker)
-        if df is None: continue
-        setup = check_bone_zone_setup(ticker, df)
+        bars = get_daily_bars(ticker)
+        if bars is None: continue
+        setup = check_bone_zone_setup(ticker, bars)
         if setup: candidates.append(setup)
 
     if not candidates:
@@ -507,10 +510,11 @@ def manage_positions(active: dict):
                 log.info(f"💵 {ticker} hit 1:1, stop → breakeven ${new_stop}")
 
             if unrealized_rr >= 2.0 and pos.get("stage") in ("RUNNING", "BREAKEVEN"):
-                df = get_daily_bars(ticker, days=60)
-                if df is not None and len(df) > 20:
-                    df["ema9"] = ema(df["close"], 9)
-                    ema9_now = df.iloc[-1]["ema9"]
+                bars = get_daily_bars(ticker, days=60)
+                if bars is not None and len(bars) > 20:
+                    closes = [b["close"] for b in bars]
+                    ema9_arr = ema_list(closes, 9)
+                    ema9_now = ema9_arr[-1]
                     trail_stop = round(ema9_now * 0.995, 2)
                     if trail_stop > pos["stop"]:
                         update_stop_loss(ticker, pos, trail_stop)
@@ -563,6 +567,7 @@ def main():
     log.info("Pullback Swinger Bot — Kunal Desai Bone Zone Strategy")
     log.info("=" * 70)
     log.info(f"Paper account: {ALPACA_BASE_URL}")
+    log.info(f"Current ET time: {now_et().strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     try:
         acc = trading.get_account()
@@ -578,6 +583,7 @@ def main():
     last_scan = 0
     last_status = 0
     last_active_sync = 0
+    last_heartbeat = 0
 
     while True:
         try:
@@ -606,8 +612,12 @@ def main():
 
             if (time.time() - last_status) >= 600:
                 turso_log_status(active, len(universe))
-                log.info(f"📊 market_open={is_market_open()} in_window={in_trading_window()} active={len(active)} universe={len(universe)}")
                 last_status = time.time()
+
+            # Heartbeat every 60 seconds so you know it's alive
+            if (time.time() - last_heartbeat) >= 60:
+                log.info(f"💓 {now.strftime('%H:%M:%S ET')} | market_open={is_market_open()} | window={in_trading_window()} | active={len(active)} | universe={len(universe)}")
+                last_heartbeat = time.time()
 
             time.sleep(30)
         except KeyboardInterrupt:
