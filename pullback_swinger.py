@@ -102,7 +102,7 @@ def turso_execute(sql: str, args: Optional[list] = None) -> Optional[dict]:
             elif isinstance(v, int):
                 typed.append({"type": "integer", "value": str(v)})
             elif isinstance(v, float):
-                typed.append({"type": "float", "value": str(v)})
+                typed.append({"type": "float", "value": v})
             else:
                 typed.append({"type": "text", "value": str(v)})
         stmt["args"] = typed
