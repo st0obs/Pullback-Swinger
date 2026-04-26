@@ -59,7 +59,36 @@ TELEGRAM_TOKEN = "8437072494:AAE4ZEEUiJo77u6WWgu19DhkOq-EFxnYsBs"
 TELEGRAM_CHAT = "8584742497"
 
 # Strategy params (locked)
-TICKERS = ["AAPL", "JPM", "WMT", "NVDA"]
+LOCKED_TICKERS = ["AAPL", "JPM", "WMT", "NVDA"]
+
+# TEST MODE: when True, also trades these tickers for Alpaca order-flow validation.
+# After earnings cycle ends, set to False to revert to locked-only.
+TEST_MODE = True
+TEST_TICKERS = ["VZ", "V", "KO", "GM", "UPS", "GOOGL", "AMZN",
+                 "META", "MSFT", "ABBV", "MA", "LLY", "XOM"]
+
+TICKERS = LOCKED_TICKERS + (TEST_TICKERS if TEST_MODE else [])
+
+# Hardcoded earnings dates for week of April 27 - May 1, 2026.
+# yfinance scan also runs but this provides immediate test data.
+HARDCODED_EARNINGS = {
+    "AAPL":  ("2026-04-30", "AMC"),
+    "VZ":    ("2026-04-27", "BMO"),
+    "GM":    ("2026-04-28", "BMO"),
+    "V":     ("2026-04-28", "AMC"),
+    "KO":    ("2026-04-28", "BMO"),
+    "UPS":   ("2026-04-28", "BMO"),
+    "GOOGL": ("2026-04-29", "AMC"),
+    "AMZN":  ("2026-04-29", "AMC"),
+    "META":  ("2026-04-29", "AMC"),
+    "MSFT":  ("2026-04-29", "AMC"),
+    "ABBV":  ("2026-04-29", "BMO"),
+    "MA":    ("2026-04-30", "BMO"),
+    "LLY":   ("2026-04-30", "BMO"),
+    "XOM":   ("2026-05-01", "BMO"),
+    # JPM, WMT, NVDA: yfinance will scan for these (next earnings later)
+}
+
 OTM_PCT = 5.0
 WING_WIDTH = 5.0
 PAPER_CAPITAL = 1000.0
@@ -336,7 +365,7 @@ def fetch_next_earnings(ticker):
 
 
 def refresh_earnings_calendar(state):
-    """Once-daily scan for next earnings dates."""
+    """Daily scan: seed from hardcoded list, then fill missing via yfinance."""
     et = now_et()
     today_iso = et.strftime("%Y-%m-%d")
 
@@ -350,19 +379,33 @@ def refresh_earnings_calendar(state):
     cal = state.get("earnings_calendar", {})
     new_detections = []
 
-    for ticker in TICKERS:
-        result = fetch_next_earnings(ticker)
-        if not result:
-            log(f"  {ticker}: no earnings date found")
+    # Step 1: seed from hardcoded if not already there
+    for ticker, (date_iso, timing) in HARDCODED_EARNINGS.items():
+        if ticker not in TICKERS:
             continue
-        date_iso, timing = result
+        # Only use hardcoded if the date is in the future
+        if date.fromisoformat(date_iso) < date.today():
+            continue
         old_entry = cal.get(ticker)
         if old_entry is None or old_entry.get("date") != date_iso:
-            new_detections.append((ticker, date_iso, timing))
-            cal[ticker] = {"date": date_iso, "timing": timing}
-            log(f"  {ticker}: {date_iso} ({timing}) — NEW/UPDATED")
+            new_detections.append((ticker, date_iso, timing, "hardcoded"))
+            cal[ticker] = {"date": date_iso, "timing": timing, "source": "hardcoded"}
+            log(f"  {ticker}: {date_iso} ({timing}) — HARDCODED")
         else:
-            log(f"  {ticker}: {date_iso} ({timing})")
+            log(f"  {ticker}: {date_iso} ({timing}) [hardcoded, cached]")
+
+    # Step 2: yfinance for any ticker without an entry
+    for ticker in TICKERS:
+        if ticker in cal:
+            continue
+        result = fetch_next_earnings(ticker)
+        if not result:
+            log(f"  {ticker}: no earnings date found via yfinance")
+            continue
+        date_iso, timing = result
+        new_detections.append((ticker, date_iso, timing, "yfinance"))
+        cal[ticker] = {"date": date_iso, "timing": timing, "source": "yfinance"}
+        log(f"  {ticker}: {date_iso} ({timing}) — yfinance")
 
     state["earnings_calendar"] = cal
     state["earnings_refreshed_today"] = True
@@ -370,8 +413,8 @@ def refresh_earnings_calendar(state):
 
     if new_detections:
         msg_lines = ["Earnings detected:"]
-        for ticker, d, timing in new_detections:
-            msg_lines.append(f"  {ticker}: {d} ({timing})")
+        for ticker, d, timing, src in new_detections:
+            msg_lines.append(f"  {ticker}: {d} ({timing}) [{src}]")
         telegram("\n".join(msg_lines))
 
 
@@ -592,7 +635,11 @@ def startup_check(state):
         return
     log("=" * 60)
     log("Pullback Swinger starting")
-    log(f"Tickers: {', '.join(TICKERS)}")
+    log(f"TEST_MODE: {TEST_MODE}")
+    log(f"Locked tickers: {', '.join(LOCKED_TICKERS)}")
+    if TEST_MODE:
+        log(f"Test tickers:   {', '.join(TEST_TICKERS)}")
+    log(f"All tracked:    {', '.join(TICKERS)}")
     log(f"Capital: ${PAPER_CAPITAL} (90%)")
     log(f"Setup: {OTM_PCT}% OTM, ${WING_WIDTH} wide")
     log(f"Entry: {ENTRY_HOUR}:{ENTRY_MIN} ET | Exit: {EXIT_HOUR}:{EXIT_MIN} ET")
@@ -605,7 +652,9 @@ def startup_check(state):
     log(f"Open positions on Alpaca: {len(pos)}")
     state["startup_done"] = True
     save_state(state)
-    telegram(f"Bot started: IV crush IC on {', '.join(TICKERS)}, ${PAPER_CAPITAL} capital")
+    mode_str = "TEST MODE" if TEST_MODE else "LOCKED MODE"
+    telegram(f"Bot started: IV crush IC ({mode_str}, {len(TICKERS)} tickers), "
+             f"${PAPER_CAPITAL} capital")
 
 
 # ============================================================
